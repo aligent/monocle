@@ -75,3 +75,6 @@ jobs:
 name: Docker
 on:
   pull_request: {}
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
