@@ -826,6 +826,12 @@ testGetFirstReviewToLastApprovalMetric = withTenantConfig tenant $ dieOnEsError 
       "first_review_to_last_approval_median_time matches"
       (mkResp . MetricPB.GetResponseResultDurationValue $ MetricPB.Duration 18000)
       medianResp
+    -- No bots in this scenario, so the bot-excluding mean equals the regular mean.
+    noBotsResp <- Monocle.Client.Api.metricGet client (mkReq "first_review_to_last_approval_mean_time_excluding_bots")
+    assertEqual
+      "first_review_to_last_approval_mean_time_excluding_bots matches (no bots in scenario)"
+      (mkResp . MetricPB.GetResponseResultDurationValue $ MetricPB.Duration 18000)
+      noBotsResp
  where
   mkResp = MetricPB.GetResponse . Just
   mkReq m =
