@@ -816,11 +816,16 @@ testGetFirstReviewToLastApprovalMetric = withTenantConfig tenant $ dieOnEsError 
     ]
 
   liftIO . Monocle.Api.Test.withTestApi env $ \client -> do
-    resp <- Monocle.Client.Api.metricGet client (mkReq "first_review_to_last_approval_mean_time")
+    meanResp <- Monocle.Client.Api.metricGet client (mkReq "first_review_to_last_approval_mean_time")
     assertEqual
       "first_review_to_last_approval_mean_time matches"
       (mkResp . MetricPB.GetResponseResultDurationValue $ MetricPB.Duration 18000)
-      resp
+      meanResp
+    medianResp <- Monocle.Client.Api.metricGet client (mkReq "first_review_to_last_approval_median_time")
+    assertEqual
+      "first_review_to_last_approval_median_time matches"
+      (mkResp . MetricPB.GetResponseResultDurationValue $ MetricPB.Duration 18000)
+      medianResp
  where
   mkResp = MetricPB.GetResponse . Just
   mkReq m =

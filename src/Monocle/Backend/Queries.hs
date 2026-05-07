@@ -523,13 +523,12 @@ firstEventOnChanges = do
           , feAuthor = author
           }
 
--- | Per-change durations between the first non-author substantive review
--- (APPROVED or CHANGES_REQUESTED) and the last non-author APPROVED review.
+-- | Per-change (last APPROVED review timestamp, duration in seconds) between
+-- the first non-author substantive review (APPROVED or CHANGES_REQUESTED)
+-- and the last non-author APPROVED review.
 -- Changes that never received an approving review are excluded.
-firstReviewToLastApprovalOnChanges :: QEffects es => Eff es [Pico]
-firstReviewToLastApprovalOnChanges = do
-  (minDate, _) <- getQueryBound
-
+firstReviewToLastApprovalDataOnChanges :: QEffects es => Eff es [(UTCTime, Pico)]
+firstReviewToLastApprovalDataOnChanges = do
   events <- catMaybes <$> doFastSearch (Right . decodeJsonReviewEvent) 10000
 
   -- Drop self-reviews up front
@@ -538,27 +537,58 @@ firstReviewToLastApprovalOnChanges = do
   let changeMap :: [NonEmpty JsonReviewEvent]
       changeMap = HM.elems $ groupBy jreChangeId nonSelf
 
-  let keepRecent :: NonEmpty JsonReviewEvent -> Bool
-      keepRecent (JsonReviewEvent {..} :| _)
-        | jreOnCreatedAt > minDate = True
-        | otherwise = False
-
-  pure $ mapMaybe perChangeDuration $ filter keepRecent changeMap
+  pure $ mapMaybe perChange changeMap
  where
   isSubstantive :: JsonReviewEvent -> Bool
   isSubstantive e = any (\a -> a == "APPROVED" || a == "CHANGES_REQUESTED") (jreApproval e)
   isApproving :: JsonReviewEvent -> Bool
   isApproving e = "APPROVED" `elem` jreApproval e
-  perChangeDuration :: NonEmpty JsonReviewEvent -> Maybe Pico
-  perChangeDuration evs =
+  perChange :: NonEmpty JsonReviewEvent -> Maybe (UTCTime, Pico)
+  perChange evs =
     let subs = jreCreatedAt <$> filter isSubstantive (toList evs)
         apps = jreCreatedAt <$> filter isApproving (toList evs)
      in case (subs, apps) of
-          (_ : _, _ : _) -> Just $ elapsedSeconds (Data.List.minimum subs) (Data.List.maximum apps)
+          (_ : _, _ : _) ->
+            let firstSub = Data.List.minimum subs
+                lastApp = Data.List.maximum apps
+             in Just (lastApp, elapsedSeconds firstSub lastApp)
+          _ -> Nothing
+
+firstReviewToLastApprovalOnChanges :: QEffects es => Eff es [Pico]
+firstReviewToLastApprovalOnChanges = do
+  (minDate, _) <- getQueryBound
+  -- For the single-value compute, exclude changes whose creation predates the
+  -- query window (we may not have their full event history).
+  events <- catMaybes <$> doFastSearch (Right . decodeJsonReviewEvent) 10000
+  let nonSelf = filter (\e -> jreAuthor e /= jreOnAuthor e) events
+  let groups = HM.elems $ groupBy jreChangeId nonSelf
+  let recent = filter (\(JsonReviewEvent {..} :| _) -> jreOnCreatedAt > minDate) groups
+  pure $ mapMaybe (fmap snd . perChange) recent
+ where
+  isSubstantive e = any (\a -> a == "APPROVED" || a == "CHANGES_REQUESTED") (jreApproval e)
+  isApproving e = "APPROVED" `elem` jreApproval e
+  perChange evs =
+    let subs = jreCreatedAt <$> filter isSubstantive (toList evs)
+        apps = jreCreatedAt <$> filter isApproving (toList evs)
+     in case (subs, apps) of
+          (_ : _, _ : _) ->
+            Just (Data.List.maximum apps, elapsedSeconds (Data.List.minimum subs) (Data.List.maximum apps))
           _ -> Nothing
 
 firstReviewToLastApprovalAverageDuration :: [Pico] -> Word32
 firstReviewToLastApprovalAverageDuration = truncate . fromMaybe 0 . average
+
+-- | Median of a list of seconds-as-Pico. Returns 0 for an empty list.
+medianDurations :: [Pico] -> Word32
+medianDurations xs =
+  let sorted = Data.List.sort xs
+      n = Data.List.length sorted
+      mid = n `div` 2
+   in case sorted of
+        [] -> 0
+        _
+          | even n -> truncate ((sorted Data.List.!! (mid - 1) + sorted Data.List.!! mid) / 2)
+          | otherwise -> truncate (sorted Data.List.!! mid)
 
 -- | The achievement query
 data ProjectBucket = ProjectBucket
@@ -1827,17 +1857,55 @@ metricFirstReviewMeanTime = baseMetricFirstEventMeanTime info flavor EChangeRevi
        When an author/group is set in the query, then this metric computes the average duration for an author/group
        to give a first review on a change.|]
 
+-- | Trend bucketed by the change's last-approval timestamp (not creation date).
+-- Avoids the right-censoring bias the change-creation bucketing has at the
+-- trailing edge. Parameterised by the aggregator (mean, median, ...).
+firstReviewToLastApprovalTrend ::
+  QEffects es =>
+  ([Pico] -> Word32) ->
+  Maybe Q.TimeRange ->
+  Eff es (V.Vector (Histo Duration))
+firstReviewToLastApprovalTrend agg intervalM = do
+  (minDate, maxDate, interval) <- queryToHistoBounds intervalM
+  -- Fetch all qualifying changes for the entire user-query window. We bucket
+  -- by lastApproval below — slicing happens in-memory rather than per-query.
+  perChange <-
+    withEvents [documentType EChangeReviewedEvent] $
+      withFlavor (QueryFlavor Author OnCreatedAt) firstReviewToLastApprovalDataOnChanges
+  let bounds = mkSliceBoundsFR maxDate interval [sliceBoundFR minDate interval]
+  pure $ fromList $ map (toBucket interval perChange) bounds
+ where
+  sliceBoundFR :: UTCTime -> Q.TimeRange -> (UTCTime, UTCTime)
+  sliceBoundFR fromDate@(UTCTime days _) interval =
+    ( fromDate
+    , case interval of
+        Q.Hour -> addUTCTime (secondsToNominalDiffTime 3600) fromDate
+        Q.Day -> UTCTime (addDays 1 days) (secondsToDiffTime 0)
+        Q.Week -> UTCTime (addDays 7 days) (secondsToDiffTime 0)
+        Q.Month -> UTCTime (addGregorianMonthsClip 1 days) (secondsToDiffTime 0)
+        Q.Year -> UTCTime (addGregorianYearsClip 1 days) (secondsToDiffTime 0)
+    )
+  mkSliceBoundsFR :: UTCTime -> Q.TimeRange -> [(UTCTime, UTCTime)] -> [(UTCTime, UTCTime)]
+  mkSliceBoundsFR maxD interval acc = case acc of
+    [] -> error "Impossible case"
+    xs | snd (Data.List.last xs) >= maxD -> acc
+    xs -> mkSliceBoundsFR maxD interval (acc <> [sliceBoundFR (snd (Data.List.last xs)) interval])
+  toBucket :: Q.TimeRange -> [(UTCTime, Pico)] -> (UTCTime, UTCTime) -> Histo Duration
+  toBucket interval perChange (lo, hi) =
+    let inSlice (lastApp, _) = lastApp >= lo && lastApp < hi
+        durs = map snd $ filter inSlice perChange
+     in Histo (from $ dateInterval interval lo) (Duration $ agg durs)
+
 -- | The average duration between the first non-author substantive review
 -- and the last non-author APPROVED review. Changes never approved are excluded.
 metricFirstReviewToLastApprovalMeanTime :: QEffects es => Metric es Duration
 metricFirstReviewToLastApprovalMeanTime =
-  Metric info (Num <$> compute) computeTrend topNotSupported
+  Metric info (Num <$> compute) (firstReviewToLastApprovalTrend firstReviewToLastApprovalAverageDuration) topNotSupported
  where
   flavor = QueryFlavor Author OnCreatedAt
   compute =
     Duration . firstReviewToLastApprovalAverageDuration
       <$> withEvents [documentType EChangeReviewedEvent] (withFlavor flavor firstReviewToLastApprovalOnChanges)
-  computeTrend = flip monoHisto compute
   info =
     MetricInfo
       "first_review_to_last_approval_mean_time"
@@ -1846,7 +1914,32 @@ metricFirstReviewToLastApprovalMeanTime =
       [iii|The metric is the average, across changes, of the duration between
        the first non-author substantive review (APPROVED or CHANGES_REQUESTED)
        and the last non-author APPROVED review. Changes that never received an
-       approving review are excluded. Self-reviews are excluded.
+       approving review are excluded. Self-reviews are excluded. The trend
+       buckets by the change's last-approval date, so each closed bucket is
+       final and not affected by changes still in review.
+       #{queryFlavorToDesc flavor}.|]
+
+-- | The median duration between the first non-author substantive review
+-- and the last non-author APPROVED review. More robust to outliers than mean.
+metricFirstReviewToLastApprovalMedianTime :: QEffects es => Metric es Duration
+metricFirstReviewToLastApprovalMedianTime =
+  Metric info (Num <$> compute) (firstReviewToLastApprovalTrend medianDurations) topNotSupported
+ where
+  flavor = QueryFlavor Author OnCreatedAt
+  compute =
+    Duration . medianDurations
+      <$> withEvents [documentType EChangeReviewedEvent] (withFlavor flavor firstReviewToLastApprovalOnChanges)
+  info =
+    MetricInfo
+      "first_review_to_last_approval_median_time"
+      "1st review to last approval median time"
+      "The median duration between the first non-author substantive review (APPROVED or CHANGES_REQUESTED) and the last non-author APPROVED review on a change."
+      [iii|The metric is the median, across changes, of the duration between
+       the first non-author substantive review (APPROVED or CHANGES_REQUESTED)
+       and the last non-author APPROVED review. Median is more robust to
+       slow-tail outliers than the mean. Self-reviews are excluded; changes
+       that never received an approving review are excluded. The trend
+       buckets by the change's last-approval date.
        #{queryFlavorToDesc flavor}.|]
 
 metricFirstReviewerMeanTime :: QEffects es => Metric es Duration
@@ -1949,6 +2042,7 @@ allMetrics =
     , toJSON <$> metricFirstCommentMeanTime
     , toJSON <$> metricFirstReviewMeanTime
     , toJSON <$> metricFirstReviewToLastApprovalMeanTime
+    , toJSON <$> metricFirstReviewToLastApprovalMedianTime
     , toJSON <$> metricFirstCommenterMeanTime
     , toJSON <$> metricFirstReviewerMeanTime
     , toJSON <$> metricCommitsPerChange

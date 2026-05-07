@@ -940,6 +940,7 @@ metricGet auth request = checkAuth auth response
       "time_to_merge_variance" -> runMetric Q.metricTimeToMergeVariance
       "first_review_mean_time" -> runMetric Q.metricFirstReviewMeanTime
       "first_review_to_last_approval_mean_time" -> runMetric Q.metricFirstReviewToLastApprovalMeanTime
+      "first_review_to_last_approval_median_time" -> runMetric Q.metricFirstReviewToLastApprovalMedianTime
       "first_comment_mean_time" -> runMetric Q.metricFirstCommentMeanTime
       "first_reviewer_mean_time" -> runMetric Q.metricFirstReviewerMeanTime
       "first_commenter_mean_time" -> runMetric Q.metricFirstCommenterMeanTime
