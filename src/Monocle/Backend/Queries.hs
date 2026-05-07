@@ -631,6 +631,41 @@ medianDurations xs =
           | even n -> truncate ((sorted Data.List.!! (mid - 1) + sorted Data.List.!! mid) / 2)
           | otherwise -> truncate (sorted Data.List.!! mid)
 
+-- | Per-change classification for "single-approve" PRs: returns
+-- (lastApprovalTime, isSingleApprove) for each change with at least one
+-- non-author APPROVED review. isSingleApprove = the change has zero
+-- non-author CHANGES_REQUESTED events. Self-reviews and excluded muids
+-- (e.g. bots, via 'includeMuid') are dropped before classification.
+firstReviewSingleApproveDataOnChanges' :: QEffects es => (Text -> Bool) -> Eff es [(UTCTime, Bool)]
+firstReviewSingleApproveDataOnChanges' includeMuid = do
+  events <- catMaybes <$> doFastSearch (Right . decodeJsonReviewEvent) 10000
+  let kept =
+        filter
+          ( \e ->
+              jreAuthor e /= jreOnAuthor e
+                && includeMuid (jreAuthor e)
+                && includeMuid (jreOnAuthor e)
+          )
+          events
+  let groups = HM.elems $ groupBy jreChangeId kept
+  pure $ mapMaybe classify groups
+ where
+  classify :: NonEmpty JsonReviewEvent -> Maybe (UTCTime, Bool)
+  classify evs =
+    let evList = toList evs
+        approvedTimes = jreCreatedAt <$> filter (\e -> "APPROVED" `elem` jreApproval e) evList
+        hasCR = any (\e -> "CHANGES_REQUESTED" `elem` jreApproval e) evList
+     in case approvedTimes of
+          [] -> Nothing
+          _ -> Just (Data.List.maximum approvedTimes, not hasCR)
+
+-- | Percentage (0..100) of single-approve PRs in the input list.
+singleApprovePercentage :: [Bool] -> Float
+singleApprovePercentage xs =
+  let total = Data.List.length xs
+      single = Data.List.length $ filter id xs
+   in if total == 0 then 0 else (fromIntegral single * 100) / fromIntegral total
+
 -- | The achievement query
 data ProjectBucket = ProjectBucket
   { pbKey :: LText
@@ -2020,6 +2055,85 @@ metricFirstReviewToLastApprovalMeanTimeExcludingBots =
        changes never approved are excluded. The trend buckets by the
        change's last-approval date. #{queryFlavorToDesc flavor}.|]
 
+-- | Trend bucketed by last-approval date for the single-approve % metrics.
+singleApprovePercentageTrend' ::
+  QEffects es =>
+  (Text -> Bool) ->
+  Maybe Q.TimeRange ->
+  Eff es (V.Vector (Histo Float))
+singleApprovePercentageTrend' includeMuid intervalM = do
+  (minDate, maxDate, interval) <- queryToHistoBounds intervalM
+  perChange <-
+    withEvents [documentType EChangeReviewedEvent] $
+      withFlavor (QueryFlavor Author OnCreatedAt) (firstReviewSingleApproveDataOnChanges' includeMuid)
+  let bounds = mkSliceBoundsFR maxDate interval [sliceBoundFR minDate interval]
+  pure $ fromList $ map (toBucket interval perChange) bounds
+ where
+  sliceBoundFR :: UTCTime -> Q.TimeRange -> (UTCTime, UTCTime)
+  sliceBoundFR fromDate@(UTCTime days _) interval =
+    ( fromDate
+    , case interval of
+        Q.Hour -> addUTCTime (secondsToNominalDiffTime 3600) fromDate
+        Q.Day -> UTCTime (addDays 1 days) (secondsToDiffTime 0)
+        Q.Week -> UTCTime (addDays 7 days) (secondsToDiffTime 0)
+        Q.Month -> UTCTime (addGregorianMonthsClip 1 days) (secondsToDiffTime 0)
+        Q.Year -> UTCTime (addGregorianYearsClip 1 days) (secondsToDiffTime 0)
+    )
+  mkSliceBoundsFR :: UTCTime -> Q.TimeRange -> [(UTCTime, UTCTime)] -> [(UTCTime, UTCTime)]
+  mkSliceBoundsFR maxD interval acc = case acc of
+    [] -> error "Impossible case"
+    xs | snd (Data.List.last xs) >= maxD -> acc
+    xs -> mkSliceBoundsFR maxD interval (acc <> [sliceBoundFR (snd (Data.List.last xs)) interval])
+  toBucket :: Q.TimeRange -> [(UTCTime, Bool)] -> (UTCTime, UTCTime) -> Histo Float
+  toBucket interval perChange (lo, hi) =
+    let inSlice (lastApp, _) = lastApp >= lo && lastApp < hi
+        flags = map snd $ filter inSlice perChange
+     in Histo (from $ dateInterval interval lo) (singleApprovePercentage flags)
+
+-- | Percentage of approved PRs that received at least one APPROVED review and
+-- zero CHANGES_REQUESTED reviews (the team approved on first read with no
+-- iteration). 0..100. Self-reviews are excluded; PRs that never received an
+-- approving review are excluded from the denominator.
+metricSingleApprovePercentage :: QEffects es => Metric es Float
+metricSingleApprovePercentage =
+  Metric info (Num <$> compute) (singleApprovePercentageTrend' (const True)) topNotSupported
+ where
+  flavor = QueryFlavor Author OnCreatedAt
+  compute =
+    singleApprovePercentage . map snd
+      <$> withEvents [documentType EChangeReviewedEvent] (withFlavor flavor (firstReviewSingleApproveDataOnChanges' (const True)))
+  info =
+    MetricInfo
+      "single_approve_percentage"
+      "single-approve PR percentage"
+      "Percentage of approved PRs that received at least one APPROVED review and zero CHANGES_REQUESTED reviews."
+      [iii|The metric is, of the changes that received any non-author APPROVED
+       review, the percentage that received zero non-author CHANGES_REQUESTED
+       reviews — i.e. the team approved on first read without iteration.
+       Self-reviews are excluded; changes that never received an approving
+       review are excluded from the denominator. The trend buckets by the
+       change's last-approval date. #{queryFlavorToDesc flavor}.|]
+
+-- | Same as metricSingleApprovePercentage but excludes bot accounts both as
+-- change authors and as reviewers.
+metricSingleApprovePercentageExcludingBots :: QEffects es => Metric es Float
+metricSingleApprovePercentageExcludingBots =
+  Metric info (Num <$> compute) (singleApprovePercentageTrend' includeMuid) topNotSupported
+ where
+  includeMuid = not . isBotMuid
+  flavor = QueryFlavor Author OnCreatedAt
+  compute =
+    singleApprovePercentage . map snd
+      <$> withEvents [documentType EChangeReviewedEvent] (withFlavor flavor (firstReviewSingleApproveDataOnChanges' includeMuid))
+  info =
+    MetricInfo
+      "single_approve_percentage_excluding_bots"
+      "single-approve PR percentage (excluding bots)"
+      "Same as single_approve_percentage but excludes bot accounts both as change authors and as reviewers."
+      [iii|Same as single_approve_percentage but excludes bot accounts both as
+       change authors and as reviewers. Bot heuristic: muid ends in [bot] or
+       matches a small known-bot allowlist. #{queryFlavorToDesc flavor}.|]
+
 metricFirstReviewerMeanTime :: QEffects es => Metric es Duration
 metricFirstReviewerMeanTime = baseMetricFirstEventMeanTime info flavor EChangeReviewedEvent
  where
@@ -2122,6 +2236,8 @@ allMetrics =
     , toJSON <$> metricFirstReviewToLastApprovalMeanTime
     , toJSON <$> metricFirstReviewToLastApprovalMedianTime
     , toJSON <$> metricFirstReviewToLastApprovalMeanTimeExcludingBots
+    , toJSON <$> metricSingleApprovePercentage
+    , toJSON <$> metricSingleApprovePercentageExcludingBots
     , toJSON <$> metricFirstCommenterMeanTime
     , toJSON <$> metricFirstReviewerMeanTime
     , toJSON <$> metricCommitsPerChange

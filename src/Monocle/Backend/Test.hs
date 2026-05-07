@@ -832,6 +832,13 @@ testGetFirstReviewToLastApprovalMetric = withTenantConfig tenant $ dieOnEsError 
       "first_review_to_last_approval_mean_time_excluding_bots matches (no bots in scenario)"
       (mkResp . MetricPB.GetResponseResultDurationValue $ MetricPB.Duration 18000)
       noBotsResp
+    -- Change 42 has a CHANGES_REQUESTED so it's NOT single-approve. Change 43
+    -- has no APPROVED so it's excluded from the denominator. Result: 0% / 1 = 0.
+    singleApproveResp <- Monocle.Client.Api.metricGet client (mkReq "single_approve_percentage")
+    assertEqual
+      "single_approve_percentage matches (change 42 has a CR, so 0%)"
+      (mkResp . MetricPB.GetResponseResultFloatValue $ 0.0)
+      singleApproveResp
  where
   mkResp = MetricPB.GetResponse . Just
   mkReq m =
