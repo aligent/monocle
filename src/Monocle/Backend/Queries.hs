@@ -553,8 +553,8 @@ firstReviewToLastApprovalOnChanges = do
   perChangeDuration evs =
     let subs = jreCreatedAt <$> filter isSubstantive (toList evs)
         apps = jreCreatedAt <$> filter isApproving (toList evs)
-     in case (nonEmpty subs, nonEmpty apps) of
-          (Just s, Just a) -> Just $ elapsedSeconds (minimum s) (maximum a)
+     in case (subs, apps) of
+          (_ : _, _ : _) -> Just $ elapsedSeconds (Data.List.minimum subs) (Data.List.maximum apps)
           _ -> Nothing
 
 firstReviewToLastApprovalAverageDuration :: [Pico] -> Word32
