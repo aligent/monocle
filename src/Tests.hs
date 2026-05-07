@@ -121,6 +121,7 @@ monocleApiTests =
     , testCase "Test crawler MDs refreshed after config reload" testReloadedConfig
     , testCase "Test get metrics" testGetMetrics
     , testCase "Test get info metric" testGetInfoMetric
+    , testCase "Test first_review_to_last_approval_mean_time" testGetFirstReviewToLastApprovalMetric
     , testCase "Test Auth Magic Token endpoint" testAuthMagicTokenEndpoint
     ]
  where

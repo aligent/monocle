@@ -462,6 +462,26 @@ firstEventDuration FirstEvent {..} = elapsedSeconds feChangeCreatedAt feCreatedA
 firstEventAverageDuration :: [FirstEvent] -> Word32
 firstEventAverageDuration = truncate . fromMaybe 0 . average . map firstEventDuration
 
+data JsonReviewEvent = JsonReviewEvent
+  { jreCreatedAt :: UTCTime
+  , jreOnCreatedAt :: UTCTime
+  , jreChangeId :: Text
+  , jreAuthor :: Text
+  , jreOnAuthor :: Text
+  , jreApproval :: [Text]
+  }
+
+decodeJsonReviewEvent :: Json.Value -> Maybe JsonReviewEvent
+decodeJsonReviewEvent v = do
+  jreCreatedAt <- Json.getDate =<< Json.getAttr "created_at" v
+  jreOnCreatedAt <- Json.getDate =<< Json.getAttr "on_created_at" v
+  jreChangeId <- Json.getString =<< Json.getAttr "change_id" v
+  jreAuthor <- Json.getString =<< Json.getAttr "muid" =<< Json.getAttr "author" v
+  jreOnAuthor <- Json.getString =<< Json.getAttr "muid" =<< Json.getAttr "on_author" v
+  -- Missing or non-array `approval` => no labels (event excluded by metric filters)
+  let jreApproval = fromMaybe [] $ traverse Json.getString =<< Json.getArray =<< Json.getAttr "approval" v
+  pure $ JsonReviewEvent {..}
+
 firstEventOnChanges :: QEffects es => Eff es [FirstEvent]
 firstEventOnChanges = do
   (minDate, _) <- getQueryBound
@@ -502,6 +522,43 @@ firstEventOnChanges = do
           , feCreatedAt = createdAt
           , feAuthor = author
           }
+
+-- | Per-change durations between the first non-author substantive review
+-- (APPROVED or CHANGES_REQUESTED) and the last non-author APPROVED review.
+-- Changes that never received an approving review are excluded.
+firstReviewToLastApprovalOnChanges :: QEffects es => Eff es [Pico]
+firstReviewToLastApprovalOnChanges = do
+  (minDate, _) <- getQueryBound
+
+  events <- catMaybes <$> doFastSearch (Right . decodeJsonReviewEvent) 10000
+
+  -- Drop self-reviews up front
+  let nonSelf = filter (\e -> jreAuthor e /= jreOnAuthor e) events
+
+  let changeMap :: [NonEmpty JsonReviewEvent]
+      changeMap = HM.elems $ groupBy jreChangeId nonSelf
+
+  let keepRecent :: NonEmpty JsonReviewEvent -> Bool
+      keepRecent (JsonReviewEvent {..} :| _)
+        | jreOnCreatedAt > minDate = True
+        | otherwise = False
+
+  pure $ mapMaybe perChangeDuration $ filter keepRecent changeMap
+ where
+  isSubstantive :: JsonReviewEvent -> Bool
+  isSubstantive e = any (\a -> a == "APPROVED" || a == "CHANGES_REQUESTED") (jreApproval e)
+  isApproving :: JsonReviewEvent -> Bool
+  isApproving e = "APPROVED" `elem` jreApproval e
+  perChangeDuration :: NonEmpty JsonReviewEvent -> Maybe Pico
+  perChangeDuration evs =
+    let subs = jreCreatedAt <$> filter isSubstantive (toList evs)
+        apps = jreCreatedAt <$> filter isApproving (toList evs)
+     in case (nonEmpty subs, nonEmpty apps) of
+          (Just s, Just a) -> Just $ elapsedSeconds (minimum s) (maximum a)
+          _ -> Nothing
+
+firstReviewToLastApprovalAverageDuration :: [Pico] -> Word32
+firstReviewToLastApprovalAverageDuration = truncate . fromMaybe 0 . average
 
 -- | The achievement query
 data ProjectBucket = ProjectBucket
@@ -1770,6 +1827,28 @@ metricFirstReviewMeanTime = baseMetricFirstEventMeanTime info flavor EChangeRevi
        When an author/group is set in the query, then this metric computes the average duration for an author/group
        to give a first review on a change.|]
 
+-- | The average duration between the first non-author substantive review
+-- and the last non-author APPROVED review. Changes never approved are excluded.
+metricFirstReviewToLastApprovalMeanTime :: QEffects es => Metric es Duration
+metricFirstReviewToLastApprovalMeanTime =
+  Metric info (Num <$> compute) computeTrend topNotSupported
+ where
+  flavor = QueryFlavor Author OnCreatedAt
+  compute =
+    Duration . firstReviewToLastApprovalAverageDuration
+      <$> withEvents [documentType EChangeReviewedEvent] (withFlavor flavor firstReviewToLastApprovalOnChanges)
+  computeTrend = flip monoHisto compute
+  info =
+    MetricInfo
+      "first_review_to_last_approval_mean_time"
+      "1st review to last approval mean time"
+      "The average duration between the first non-author substantive review (APPROVED or CHANGES_REQUESTED) and the last non-author APPROVED review on a change."
+      [iii|The metric is the average, across changes, of the duration between
+       the first non-author substantive review (APPROVED or CHANGES_REQUESTED)
+       and the last non-author APPROVED review. Changes that never received an
+       approving review are excluded. Self-reviews are excluded.
+       #{queryFlavorToDesc flavor}.|]
+
 metricFirstReviewerMeanTime :: QEffects es => Metric es Duration
 metricFirstReviewerMeanTime = baseMetricFirstEventMeanTime info flavor EChangeReviewedEvent
  where
@@ -1869,6 +1948,7 @@ allMetrics =
     , toJSON <$> metricTimeToMergeVariance
     , toJSON <$> metricFirstCommentMeanTime
     , toJSON <$> metricFirstReviewMeanTime
+    , toJSON <$> metricFirstReviewToLastApprovalMeanTime
     , toJSON <$> metricFirstCommenterMeanTime
     , toJSON <$> metricFirstReviewerMeanTime
     , toJSON <$> metricCommitsPerChange

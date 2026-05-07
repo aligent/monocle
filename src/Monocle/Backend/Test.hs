@@ -768,6 +768,73 @@ testGetMetrics = withTenantConfig tenant $ dieOnEsError do
   tenantName = hardcodedIndexName "test-metric-tenant"
   tenant = Config.mkTenant tenantName
 
+-- | Index two changes, one approved (3 non-author reviews + 1 self-review
+-- to be ignored), one only-commented (excluded from the average), and assert
+-- that the metric returns the expected duration on the approved change.
+testGetFirstReviewToLastApprovalMetric :: Assertion
+testGetFirstReviewToLastApprovalMetric = withTenantConfig tenant $ dieOnEsError do
+  let repo = "openstack/nova"
+      author = eve
+      reviewer = alice
+      mkRev :: LText -> Integer -> Author -> [LText] -> LText -> EChangeEvent
+      mkRev cid ts who approval suffix =
+        let base = mkEvent ts fakeDate EChangeReviewedEvent who author cid repo
+         in base
+              { echangeeventApproval = Just approval
+              , echangeeventId = echangeeventId base <> "-" <> suffix
+              }
+
+  -- Change 42: t+30m self APPROVED (excluded as self-review),
+  --            t+1h  alice CHANGES_REQUESTED (first substantive),
+  --            t+5h  alice APPROVED,
+  --            t+6h  alice APPROVED (last APPROVED).
+  -- Expected per-change duration = 6h - 1h = 5h = 18000s.
+  let cid42 = "42"
+      change42 = mkChange 0 fakeDate author cid42 repo EChangeOpen
+      created42 = mkEvent 0 fakeDate EChangeCreatedEvent author author cid42 repo
+      selfApproved = mkRev cid42 1800 author ["APPROVED"] "self"
+      cr1 = mkRev cid42 3600 reviewer ["CHANGES_REQUESTED"] "cr1"
+      ap1 = mkRev cid42 18000 reviewer ["APPROVED"] "ap1"
+      ap2 = mkRev cid42 21600 reviewer ["APPROVED"] "ap2"
+
+  -- Change 43: only COMMENTED — never approved, excluded from average.
+  let cid43 = "43"
+      change43 = mkChange 0 fakeDate author cid43 repo EChangeOpen
+      created43 = mkEvent 0 fakeDate EChangeCreatedEvent author author cid43 repo
+      onlyCommented = mkRev cid43 1800 reviewer ["COMMENTED"] "co"
+
+  indexScenario
+    [ SChange change42
+    , SCreation created42
+    , SReview selfApproved
+    , SReview cr1
+    , SReview ap1
+    , SReview ap2
+    , SChange change43
+    , SCreation created43
+    , SReview onlyCommented
+    ]
+
+  liftIO . Monocle.Api.Test.withTestApi env $ \client -> do
+    resp <- Monocle.Client.Api.metricGet client (mkReq "first_review_to_last_approval_mean_time")
+    assertEqual
+      "first_review_to_last_approval_mean_time matches"
+      (mkResp . MetricPB.GetResponseResultDurationValue $ MetricPB.Duration 18000)
+      resp
+ where
+  mkResp = MetricPB.GetResponse . Just
+  mkReq m =
+    MetricPB.GetRequest
+      { MetricPB.getRequestIndex = from tenantName
+      , MetricPB.getRequestUsername = ""
+      , MetricPB.getRequestQuery = "from:2021-01-01 to:2022-01-01"
+      , MetricPB.getRequestMetric = m
+      , MetricPB.getRequestOptions = Nothing
+      }
+  env = Monocle.Api.Test.mkAppEnv tenant
+  tenantName = hardcodedIndexName "test-metric-tenant-fr-la"
+  tenant = Config.mkTenant tenantName
+
 testReposSummary :: Assertion
 testReposSummary = withTenant doTest
  where
