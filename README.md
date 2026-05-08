@@ -1,5 +1,81 @@
 # Monocle
 
+> **Aligent fork.** Adds review-cycle metrics and an alternative dashboard on top of upstream `change-metrics/monocle`. See **[Local development quickstart](#local-development-quickstart)** below for running this fork. Upstream README follows from [Monocle](#monocle-upstream-readme) onward.
+
+## Local development quickstart
+
+The stack runs entirely on `docker compose`:
+
+| Service        | Port  | What                                                    |
+| -------------- | ----- | ------------------------------------------------------- |
+| `api`          | 8080  | Monocle API + the official ReScript Web UI              |
+| `crawler`      | —     | Pulls changes from the configured providers             |
+| `elastic`      | —     | ES data store, network-internal only                    |
+| `alt-frontend` | 3001  | Lightweight alternative dashboard (`alt-frontend/`)     |
+
+CI (`.github/workflows/docker.yaml`) publishes the API/crawler image to `ghcr.io/aligent/monocle:dev` (and `:<commit-sha>`) on every PR push. The compose file references the legacy `quay.io/change-metrics/monocle` path, so the local flow pulls from GHCR and retags.
+
+### First time
+
+```sh
+git clone git@github.com:aligent/monocle.git && cd monocle
+echo "CRAWLERS_API_KEY=$(uuidgen)" > .secrets
+echo "GITHUB_TOKEN=<your_pat>"     >> .secrets
+echo "COMPOSE_MONOCLE_VERSION=dev"  > .env
+# Edit etc/config.yaml — schema is described under "Installation" further down.
+```
+
+### Bring it up
+
+```sh
+docker pull ghcr.io/aligent/monocle:dev
+docker tag  ghcr.io/aligent/monocle:dev quay.io/change-metrics/monocle:dev
+docker compose up -d
+```
+
+- Web UI: <http://localhost:8080/>
+- Alt dashboard: <http://localhost:3001/>
+
+### Pull a newer build
+
+After CI lands a green build for the branch:
+
+```sh
+docker pull ghcr.io/aligent/monocle:dev
+docker tag  ghcr.io/aligent/monocle:dev quay.io/change-metrics/monocle:dev
+docker compose up -d --force-recreate api crawler
+```
+
+Recreating `api` cascades to `elastic`; ES takes 10–20 s to come back, so the API will crashloop briefly until ES is ready.
+
+### Edit the alt-frontend
+
+`alt-frontend/` is bind-mounted into the nginx container with `Cache-Control: no-store`. Edit `index.html`/`styles.css`/`app.js` and refresh the browser — no rebuild, no restart.
+
+### ES disk-watermark crashloop recovery
+
+If `api` crashloops on startup with `cluster_block_exception ... disk usage exceeded flood-stage watermark`, the ES data volume hit the flood-stage watermark and locked indices read-only. The API then 429s on its first index settings write and dies.
+
+For a dev sandbox, disable the disk-threshold check and clear the block:
+
+```sh
+docker compose exec elastic curl -sS -X PUT \
+  'http://localhost:9200/_cluster/settings' \
+  -H 'Content-Type: application/json' \
+  -d '{"transient":{"cluster.routing.allocation.disk.threshold_enabled":false}}'
+
+docker compose exec elastic curl -sS -X PUT \
+  'http://localhost:9200/_all/_settings' \
+  -H 'Content-Type: application/json' \
+  -d '{"index.blocks.read_only_allow_delete": null}'
+```
+
+The cluster setting is `transient` — lost after an ES restart, so it may need re-applying after `docker compose up`. Permanent fix: free disk below the high watermark (~85%) on the host volume holding `./data`.
+
+---
+
+# Monocle (upstream README)
+
 Monocle is designed for development teams to provide:
 
 - analytics on project changes
