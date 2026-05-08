@@ -942,6 +942,7 @@ metricGet auth request = checkAuth auth response
       "first_review_to_last_approval_mean_time" -> runMetric Q.metricFirstReviewToLastApprovalMeanTime
       "first_review_to_last_approval_median_time" -> runMetric Q.metricFirstReviewToLastApprovalMedianTime
       "first_review_to_last_approval_mean_time_excluding_bots" -> runMetric Q.metricFirstReviewToLastApprovalMeanTimeExcludingBots
+      "first_review_to_last_approval_mean_time_excluding_bots_min_5m" -> runMetric Q.metricFirstReviewToLastApprovalMeanTimeExcludingBotsMin5m
       "single_approve_percentage" -> runMetric Q.metricSingleApprovePercentage
       "single_approve_percentage_excluding_bots" -> runMetric Q.metricSingleApprovePercentageExcludingBots
       "first_comment_mean_time" -> runMetric Q.metricFirstCommentMeanTime
