@@ -8,6 +8,7 @@ import Data.Aeson.Types qualified as Aeson
 import Data.HashMap.Strict qualified as HM
 import Data.List qualified
 import Data.Map qualified as Map
+import Data.Text qualified as Text
 import Data.Ord qualified
 import Data.String.Interpolate (i, iii)
 import Data.Time (UTCTime (UTCTime), addDays, addGregorianMonthsClip, addGregorianYearsClip, secondsToNominalDiffTime)
@@ -462,6 +463,26 @@ firstEventDuration FirstEvent {..} = elapsedSeconds feChangeCreatedAt feCreatedA
 firstEventAverageDuration :: [FirstEvent] -> Word32
 firstEventAverageDuration = truncate . fromMaybe 0 . average . map firstEventDuration
 
+data JsonReviewEvent = JsonReviewEvent
+  { jreCreatedAt :: UTCTime
+  , jreOnCreatedAt :: UTCTime
+  , jreChangeId :: Text
+  , jreAuthor :: Text
+  , jreOnAuthor :: Text
+  , jreApproval :: [Text]
+  }
+
+decodeJsonReviewEvent :: Json.Value -> Maybe JsonReviewEvent
+decodeJsonReviewEvent v = do
+  jreCreatedAt <- Json.getDate =<< Json.getAttr "created_at" v
+  jreOnCreatedAt <- Json.getDate =<< Json.getAttr "on_created_at" v
+  jreChangeId <- Json.getString =<< Json.getAttr "change_id" v
+  jreAuthor <- Json.getString =<< Json.getAttr "muid" =<< Json.getAttr "author" v
+  jreOnAuthor <- Json.getString =<< Json.getAttr "muid" =<< Json.getAttr "on_author" v
+  -- Missing or non-array `approval` => no labels (event excluded by metric filters)
+  let jreApproval = fromMaybe [] $ traverse Json.getString =<< Json.getArray =<< Json.getAttr "approval" v
+  pure $ JsonReviewEvent {..}
+
 firstEventOnChanges :: QEffects es => Eff es [FirstEvent]
 firstEventOnChanges = do
   (minDate, _) <- getQueryBound
@@ -502,6 +523,148 @@ firstEventOnChanges = do
           , feCreatedAt = createdAt
           , feAuthor = author
           }
+
+-- | Recognise GitHub bot accounts. Matches any muid ending in `[bot]` plus a
+-- short known-bots allowlist for service accounts that don't carry the suffix.
+isBotMuid :: Text -> Bool
+isBotMuid muid = "[bot]" `Text.isSuffixOf` muid || muid `elem` knownBotMuids
+ where
+  knownBotMuids :: [Text]
+  knownBotMuids =
+    [ "dependabot"
+    , "renovate-bot"
+    , "vercel"
+    , "github-actions"
+    , "aikido-autofix"
+    , "aikido-pr-checks"
+    , "copilot-pull-request-reviewer"
+    , "github-advanced-security"
+    , "aligent-ai-code-reviewer"
+    ]
+
+-- | Per-change (last APPROVED review timestamp, duration in seconds) between
+-- the first non-author substantive review (APPROVED or CHANGES_REQUESTED)
+-- and the last non-author APPROVED review.
+-- Changes that never received an approving review are excluded.
+-- 'includeMuid' lets callers exclude reviewers and/or change-authors by muid
+-- (e.g. to drop bot-driven activity).
+firstReviewToLastApprovalDataOnChanges' :: QEffects es => (Text -> Bool) -> Eff es [(UTCTime, Pico)]
+firstReviewToLastApprovalDataOnChanges' includeMuid = do
+  events <- catMaybes <$> doFastSearch (Right . decodeJsonReviewEvent) 10000
+
+  -- Drop self-reviews and any events whose reviewer or change-author is excluded.
+  let kept =
+        filter
+          ( \e ->
+              jreAuthor e /= jreOnAuthor e
+                && includeMuid (jreAuthor e)
+                && includeMuid (jreOnAuthor e)
+          )
+          events
+
+  let changeMap :: [NonEmpty JsonReviewEvent]
+      changeMap = HM.elems $ groupBy jreChangeId kept
+
+  pure $ mapMaybe perChange changeMap
+ where
+  isSubstantive :: JsonReviewEvent -> Bool
+  isSubstantive e = any (\a -> a == "APPROVED" || a == "CHANGES_REQUESTED") (jreApproval e)
+  isApproving :: JsonReviewEvent -> Bool
+  isApproving e = "APPROVED" `elem` jreApproval e
+  perChange :: NonEmpty JsonReviewEvent -> Maybe (UTCTime, Pico)
+  perChange evs =
+    let subs = jreCreatedAt <$> filter isSubstantive (toList evs)
+        apps = jreCreatedAt <$> filter isApproving (toList evs)
+     in case (subs, apps) of
+          (_ : _, _ : _) ->
+            let firstSub = Data.List.minimum subs
+                lastApp = Data.List.maximum apps
+             in Just (lastApp, elapsedSeconds firstSub lastApp)
+          _ -> Nothing
+
+firstReviewToLastApprovalDataOnChanges :: QEffects es => Eff es [(UTCTime, Pico)]
+firstReviewToLastApprovalDataOnChanges = firstReviewToLastApprovalDataOnChanges' (const True)
+
+firstReviewToLastApprovalOnChanges' :: QEffects es => (Text -> Bool) -> Eff es [Pico]
+firstReviewToLastApprovalOnChanges' includeMuid = do
+  (minDate, _) <- getQueryBound
+  -- For the single-value compute, exclude changes whose creation predates the
+  -- query window (we may not have their full event history).
+  events <- catMaybes <$> doFastSearch (Right . decodeJsonReviewEvent) 10000
+  let kept =
+        filter
+          ( \e ->
+              jreAuthor e /= jreOnAuthor e
+                && includeMuid (jreAuthor e)
+                && includeMuid (jreOnAuthor e)
+          )
+          events
+  let groups = HM.elems $ groupBy jreChangeId kept
+  let recent = filter (\(JsonReviewEvent {..} :| _) -> jreOnCreatedAt > minDate) groups
+  pure $ mapMaybe (fmap snd . perChange) recent
+ where
+  isSubstantive e = any (\a -> a == "APPROVED" || a == "CHANGES_REQUESTED") (jreApproval e)
+  isApproving e = "APPROVED" `elem` jreApproval e
+  perChange evs =
+    let subs = jreCreatedAt <$> filter isSubstantive (toList evs)
+        apps = jreCreatedAt <$> filter isApproving (toList evs)
+     in case (subs, apps) of
+          (_ : _, _ : _) ->
+            Just (Data.List.maximum apps, elapsedSeconds (Data.List.minimum subs) (Data.List.maximum apps))
+          _ -> Nothing
+
+firstReviewToLastApprovalOnChanges :: QEffects es => Eff es [Pico]
+firstReviewToLastApprovalOnChanges = firstReviewToLastApprovalOnChanges' (const True)
+
+firstReviewToLastApprovalAverageDuration :: [Pico] -> Word32
+firstReviewToLastApprovalAverageDuration = truncate . fromMaybe 0 . average
+
+-- | Median of a list of seconds-as-Pico. Returns 0 for an empty list.
+medianDurations :: [Pico] -> Word32
+medianDurations xs =
+  let sorted = Data.List.sort xs
+      n = Data.List.length sorted
+      mid = n `div` 2
+   in case sorted of
+        [] -> 0
+        _
+          | even n -> truncate ((sorted Data.List.!! (mid - 1) + sorted Data.List.!! mid) / 2)
+          | otherwise -> truncate (sorted Data.List.!! mid)
+
+-- | Per-change classification for "single-approve" PRs: returns
+-- (lastApprovalTime, isSingleApprove) for each change with at least one
+-- non-author APPROVED review. isSingleApprove = the change has zero
+-- non-author CHANGES_REQUESTED events. Self-reviews and excluded muids
+-- (e.g. bots, via 'includeMuid') are dropped before classification.
+firstReviewSingleApproveDataOnChanges' :: QEffects es => (Text -> Bool) -> Eff es [(UTCTime, Bool)]
+firstReviewSingleApproveDataOnChanges' includeMuid = do
+  events <- catMaybes <$> doFastSearch (Right . decodeJsonReviewEvent) 10000
+  let kept =
+        filter
+          ( \e ->
+              jreAuthor e /= jreOnAuthor e
+                && includeMuid (jreAuthor e)
+                && includeMuid (jreOnAuthor e)
+          )
+          events
+  let groups = HM.elems $ groupBy jreChangeId kept
+  pure $ mapMaybe classify groups
+ where
+  classify :: NonEmpty JsonReviewEvent -> Maybe (UTCTime, Bool)
+  classify evs =
+    let evList = toList evs
+        approvedTimes = jreCreatedAt <$> filter (\e -> "APPROVED" `elem` jreApproval e) evList
+        hasCR = any (\e -> "CHANGES_REQUESTED" `elem` jreApproval e) evList
+     in case approvedTimes of
+          [] -> Nothing
+          _ -> Just (Data.List.maximum approvedTimes, not hasCR)
+
+-- | Percentage (0..100) of single-approve PRs in the input list.
+singleApprovePercentage :: [Bool] -> Float
+singleApprovePercentage xs =
+  let total = Data.List.length xs
+      single = Data.List.length $ filter id xs
+   in if total == 0 then 0 else (fromIntegral single * 100) / fromIntegral total
 
 -- | The achievement query
 data ProjectBucket = ProjectBucket
@@ -1770,6 +1933,263 @@ metricFirstReviewMeanTime = baseMetricFirstEventMeanTime info flavor EChangeRevi
        When an author/group is set in the query, then this metric computes the average duration for an author/group
        to give a first review on a change.|]
 
+-- | Trend bucketed by the change's last-approval timestamp (not creation date).
+-- Avoids the right-censoring bias the change-creation bucketing has at the
+-- trailing edge. Parameterised by the aggregator (mean, median, ...).
+firstReviewToLastApprovalTrend' ::
+  QEffects es =>
+  (Text -> Bool) ->
+  ([Pico] -> Word32) ->
+  Maybe Q.TimeRange ->
+  Eff es (V.Vector (Histo Duration))
+firstReviewToLastApprovalTrend' includeMuid agg intervalM = do
+  (minDate, maxDate, interval) <- queryToHistoBounds intervalM
+  -- Fetch all qualifying changes for the entire user-query window. We bucket
+  -- by lastApproval below — slicing happens in-memory rather than per-query.
+  perChange <-
+    withEvents [documentType EChangeReviewedEvent] $
+      withFlavor (QueryFlavor Author OnCreatedAt) (firstReviewToLastApprovalDataOnChanges' includeMuid)
+  let bounds = mkSliceBoundsFR maxDate interval [sliceBoundFR minDate interval]
+  pure $ fromList $ map (toBucket interval perChange) bounds
+ where
+  sliceBoundFR :: UTCTime -> Q.TimeRange -> (UTCTime, UTCTime)
+  sliceBoundFR fromDate@(UTCTime days _) interval =
+    ( fromDate
+    , case interval of
+        Q.Hour -> addUTCTime (secondsToNominalDiffTime 3600) fromDate
+        Q.Day -> UTCTime (addDays 1 days) (secondsToDiffTime 0)
+        Q.Week -> UTCTime (addDays 7 days) (secondsToDiffTime 0)
+        Q.Month -> UTCTime (addGregorianMonthsClip 1 days) (secondsToDiffTime 0)
+        Q.Year -> UTCTime (addGregorianYearsClip 1 days) (secondsToDiffTime 0)
+    )
+  mkSliceBoundsFR :: UTCTime -> Q.TimeRange -> [(UTCTime, UTCTime)] -> [(UTCTime, UTCTime)]
+  mkSliceBoundsFR maxD interval acc = case acc of
+    [] -> error "Impossible case"
+    xs | snd (Data.List.last xs) >= maxD -> acc
+    xs -> mkSliceBoundsFR maxD interval (acc <> [sliceBoundFR (snd (Data.List.last xs)) interval])
+  toBucket :: Q.TimeRange -> [(UTCTime, Pico)] -> (UTCTime, UTCTime) -> Histo Duration
+  toBucket interval perChange (lo, hi) =
+    let inSlice (lastApp, _) = lastApp >= lo && lastApp < hi
+        durs = map snd $ filter inSlice perChange
+     in Histo (from $ dateInterval interval lo) (Duration $ agg durs)
+
+firstReviewToLastApprovalTrend ::
+  QEffects es =>
+  ([Pico] -> Word32) ->
+  Maybe Q.TimeRange ->
+  Eff es (V.Vector (Histo Duration))
+firstReviewToLastApprovalTrend = firstReviewToLastApprovalTrend' (const True)
+
+-- | The average duration between the first non-author substantive review
+-- and the last non-author APPROVED review. Changes never approved are excluded.
+metricFirstReviewToLastApprovalMeanTime :: QEffects es => Metric es Duration
+metricFirstReviewToLastApprovalMeanTime =
+  Metric info (Num <$> compute) (firstReviewToLastApprovalTrend firstReviewToLastApprovalAverageDuration) topNotSupported
+ where
+  flavor = QueryFlavor Author OnCreatedAt
+  compute =
+    Duration . firstReviewToLastApprovalAverageDuration
+      <$> withEvents [documentType EChangeReviewedEvent] (withFlavor flavor firstReviewToLastApprovalOnChanges)
+  info =
+    MetricInfo
+      "first_review_to_last_approval_mean_time"
+      "1st review to last approval mean time"
+      "The average duration between the first non-author substantive review (APPROVED or CHANGES_REQUESTED) and the last non-author APPROVED review on a change."
+      [iii|The metric is the average, across changes, of the duration between
+       the first non-author substantive review (APPROVED or CHANGES_REQUESTED)
+       and the last non-author APPROVED review. Changes that never received an
+       approving review are excluded. Self-reviews are excluded. The trend
+       buckets by the change's last-approval date, so each closed bucket is
+       final and not affected by changes still in review.
+       #{queryFlavorToDesc flavor}.|]
+
+-- | The median duration between the first non-author substantive review
+-- and the last non-author APPROVED review. More robust to outliers than mean.
+metricFirstReviewToLastApprovalMedianTime :: QEffects es => Metric es Duration
+metricFirstReviewToLastApprovalMedianTime =
+  Metric info (Num <$> compute) (firstReviewToLastApprovalTrend medianDurations) topNotSupported
+ where
+  flavor = QueryFlavor Author OnCreatedAt
+  compute =
+    Duration . medianDurations
+      <$> withEvents [documentType EChangeReviewedEvent] (withFlavor flavor firstReviewToLastApprovalOnChanges)
+  info =
+    MetricInfo
+      "first_review_to_last_approval_median_time"
+      "1st review to last approval median time"
+      "The median duration between the first non-author substantive review (APPROVED or CHANGES_REQUESTED) and the last non-author APPROVED review on a change."
+      [iii|The metric is the median, across changes, of the duration between
+       the first non-author substantive review (APPROVED or CHANGES_REQUESTED)
+       and the last non-author APPROVED review. Median is more robust to
+       slow-tail outliers than the mean. Self-reviews are excluded; changes
+       that never received an approving review are excluded. The trend
+       buckets by the change's last-approval date.
+       #{queryFlavorToDesc flavor}.|]
+
+-- | Variant of metricFirstReviewToLastApprovalMeanTime that excludes bot
+-- accounts both as change authors and as reviewers. Bot heuristic: muid ends
+-- in [bot] or matches a small known-bot allowlist (dependabot, renovate-bot,
+-- vercel, github-actions, aikido-*, copilot-pull-request-reviewer,
+-- github-advanced-security, aligent-ai-code-reviewer).
+metricFirstReviewToLastApprovalMeanTimeExcludingBots :: QEffects es => Metric es Duration
+metricFirstReviewToLastApprovalMeanTimeExcludingBots =
+  Metric info (Num <$> compute) (firstReviewToLastApprovalTrend' includeMuid firstReviewToLastApprovalAverageDuration) topNotSupported
+ where
+  includeMuid = not . isBotMuid
+  flavor = QueryFlavor Author OnCreatedAt
+  compute =
+    Duration . firstReviewToLastApprovalAverageDuration
+      <$> withEvents [documentType EChangeReviewedEvent] (withFlavor flavor (firstReviewToLastApprovalOnChanges' includeMuid))
+  info =
+    MetricInfo
+      "first_review_to_last_approval_mean_time_excluding_bots"
+      "1st review to last approval mean time (excluding bots)"
+      "Same as first_review_to_last_approval_mean_time but excludes bot accounts both as change authors and as reviewers."
+      [iii|The metric is the average, across changes, of the duration between
+       the first non-author substantive review (APPROVED or CHANGES_REQUESTED)
+       and the last non-author APPROVED review, with bot accounts excluded
+       both as change authors and as reviewers. A bot is any muid ending in
+       [bot] or one of: dependabot, renovate-bot, vercel, github-actions,
+       aikido-autofix, aikido-pr-checks, copilot-pull-request-reviewer,
+       github-advanced-security, aligent-ai-code-reviewer. Self-reviews and
+       changes never approved are excluded. The trend buckets by the
+       change's last-approval date. #{queryFlavorToDesc flavor}.|]
+
+-- | Variant of metricFirstReviewToLastApprovalMeanTimeExcludingBots that
+-- additionally discards per-change durations under 5 minutes before
+-- averaging — filters out rubber-stamp / auto-merge events that would
+-- otherwise pull the mean toward zero.
+metricFirstReviewToLastApprovalMeanTimeExcludingBotsMin5m :: QEffects es => Metric es Duration
+metricFirstReviewToLastApprovalMeanTimeExcludingBotsMin5m =
+  Metric info (Num <$> compute) (firstReviewToLastApprovalTrend' includeMuid agg) topNotSupported
+ where
+  includeMuid = not . isBotMuid
+  flavor = QueryFlavor Author OnCreatedAt
+  minDur = 300 :: Pico
+  agg = firstReviewToLastApprovalAverageDuration . filter (>= minDur)
+  compute =
+    Duration . agg
+      <$> withEvents [documentType EChangeReviewedEvent] (withFlavor flavor (firstReviewToLastApprovalOnChanges' includeMuid))
+  info =
+    MetricInfo
+      "first_review_to_last_approval_mean_time_excluding_bots_min_5m"
+      "1st review to last approval mean time (excluding bots, ignoring <5m)"
+      "Same as first_review_to_last_approval_mean_time_excluding_bots but discards per-change durations under 5 minutes before averaging."
+      [iii|Same as first_review_to_last_approval_mean_time_excluding_bots, with
+       any per-change first-review-to-last-approval duration under 5 minutes
+       (300 seconds) discarded before averaging. Removes rubber-stamp /
+       auto-merge events that would otherwise pull the mean toward zero.
+       Self-reviews and changes never approved are also excluded. The trend
+       buckets by the change's last-approval date.
+       #{queryFlavorToDesc flavor}.|]
+
+-- | Median sibling of metricFirstReviewToLastApprovalMeanTimeExcludingBotsMin5m.
+-- Drops per-change durations under 5 minutes before taking the median.
+-- More robust to slow-tail outliers than the mean.
+metricFirstReviewToLastApprovalMedianTimeExcludingBotsMin5m :: QEffects es => Metric es Duration
+metricFirstReviewToLastApprovalMedianTimeExcludingBotsMin5m =
+  Metric info (Num <$> compute) (firstReviewToLastApprovalTrend' includeMuid agg) topNotSupported
+ where
+  includeMuid = not . isBotMuid
+  flavor = QueryFlavor Author OnCreatedAt
+  minDur = 300 :: Pico
+  agg = medianDurations . filter (>= minDur)
+  compute =
+    Duration . agg
+      <$> withEvents [documentType EChangeReviewedEvent] (withFlavor flavor (firstReviewToLastApprovalOnChanges' includeMuid))
+  info =
+    MetricInfo
+      "first_review_to_last_approval_median_time_excluding_bots_min_5m"
+      "1st review to last approval median time (excluding bots, ignoring <5m)"
+      "Median variant of first_review_to_last_approval_mean_time_excluding_bots_min_5m. Discards per-change durations under 5 minutes, then takes the median."
+      [iii|Median across changes of the duration between the first non-author
+       substantive review (APPROVED or CHANGES_REQUESTED) and the last
+       non-author APPROVED review, with bot accounts excluded both as
+       authors and as reviewers, and per-change durations under 5 minutes
+       (300 seconds) discarded before computing the median. More robust to
+       slow-tail outliers than the mean. Self-reviews and changes never
+       approved are also excluded. The trend buckets by the change's
+       last-approval date. #{queryFlavorToDesc flavor}.|]
+
+-- | Trend bucketed by last-approval date for the single-approve % metrics.
+singleApprovePercentageTrend' ::
+  QEffects es =>
+  (Text -> Bool) ->
+  Maybe Q.TimeRange ->
+  Eff es (V.Vector (Histo Float))
+singleApprovePercentageTrend' includeMuid intervalM = do
+  (minDate, maxDate, interval) <- queryToHistoBounds intervalM
+  perChange <-
+    withEvents [documentType EChangeReviewedEvent] $
+      withFlavor (QueryFlavor Author OnCreatedAt) (firstReviewSingleApproveDataOnChanges' includeMuid)
+  let bounds = mkSliceBoundsFR maxDate interval [sliceBoundFR minDate interval]
+  pure $ fromList $ map (toBucket interval perChange) bounds
+ where
+  sliceBoundFR :: UTCTime -> Q.TimeRange -> (UTCTime, UTCTime)
+  sliceBoundFR fromDate@(UTCTime days _) interval =
+    ( fromDate
+    , case interval of
+        Q.Hour -> addUTCTime (secondsToNominalDiffTime 3600) fromDate
+        Q.Day -> UTCTime (addDays 1 days) (secondsToDiffTime 0)
+        Q.Week -> UTCTime (addDays 7 days) (secondsToDiffTime 0)
+        Q.Month -> UTCTime (addGregorianMonthsClip 1 days) (secondsToDiffTime 0)
+        Q.Year -> UTCTime (addGregorianYearsClip 1 days) (secondsToDiffTime 0)
+    )
+  mkSliceBoundsFR :: UTCTime -> Q.TimeRange -> [(UTCTime, UTCTime)] -> [(UTCTime, UTCTime)]
+  mkSliceBoundsFR maxD interval acc = case acc of
+    [] -> error "Impossible case"
+    xs | snd (Data.List.last xs) >= maxD -> acc
+    xs -> mkSliceBoundsFR maxD interval (acc <> [sliceBoundFR (snd (Data.List.last xs)) interval])
+  toBucket :: Q.TimeRange -> [(UTCTime, Bool)] -> (UTCTime, UTCTime) -> Histo Float
+  toBucket interval perChange (lo, hi) =
+    let inSlice (lastApp, _) = lastApp >= lo && lastApp < hi
+        flags = map snd $ filter inSlice perChange
+     in Histo (from $ dateInterval interval lo) (singleApprovePercentage flags)
+
+-- | Percentage of approved PRs that received at least one APPROVED review and
+-- zero CHANGES_REQUESTED reviews (the team approved on first read with no
+-- iteration). 0..100. Self-reviews are excluded; PRs that never received an
+-- approving review are excluded from the denominator.
+metricSingleApprovePercentage :: QEffects es => Metric es Float
+metricSingleApprovePercentage =
+  Metric info (Num <$> compute) (singleApprovePercentageTrend' (const True)) topNotSupported
+ where
+  flavor = QueryFlavor Author OnCreatedAt
+  compute =
+    singleApprovePercentage . map snd
+      <$> withEvents [documentType EChangeReviewedEvent] (withFlavor flavor (firstReviewSingleApproveDataOnChanges' (const True)))
+  info =
+    MetricInfo
+      "single_approve_percentage"
+      "single-approve PR percentage"
+      "Percentage of approved PRs that received at least one APPROVED review and zero CHANGES_REQUESTED reviews."
+      [iii|The metric is, of the changes that received any non-author APPROVED
+       review, the percentage that received zero non-author CHANGES_REQUESTED
+       reviews — i.e. the team approved on first read without iteration.
+       Self-reviews are excluded; changes that never received an approving
+       review are excluded from the denominator. The trend buckets by the
+       change's last-approval date. #{queryFlavorToDesc flavor}.|]
+
+-- | Same as metricSingleApprovePercentage but excludes bot accounts both as
+-- change authors and as reviewers.
+metricSingleApprovePercentageExcludingBots :: QEffects es => Metric es Float
+metricSingleApprovePercentageExcludingBots =
+  Metric info (Num <$> compute) (singleApprovePercentageTrend' includeMuid) topNotSupported
+ where
+  includeMuid = not . isBotMuid
+  flavor = QueryFlavor Author OnCreatedAt
+  compute =
+    singleApprovePercentage . map snd
+      <$> withEvents [documentType EChangeReviewedEvent] (withFlavor flavor (firstReviewSingleApproveDataOnChanges' includeMuid))
+  info =
+    MetricInfo
+      "single_approve_percentage_excluding_bots"
+      "single-approve PR percentage (excluding bots)"
+      "Same as single_approve_percentage but excludes bot accounts both as change authors and as reviewers."
+      [iii|Same as single_approve_percentage but excludes bot accounts both as
+       change authors and as reviewers. Bot heuristic: muid ends in [bot] or
+       matches a small known-bot allowlist. #{queryFlavorToDesc flavor}.|]
+
 metricFirstReviewerMeanTime :: QEffects es => Metric es Duration
 metricFirstReviewerMeanTime = baseMetricFirstEventMeanTime info flavor EChangeReviewedEvent
  where
@@ -1869,6 +2289,13 @@ allMetrics =
     , toJSON <$> metricTimeToMergeVariance
     , toJSON <$> metricFirstCommentMeanTime
     , toJSON <$> metricFirstReviewMeanTime
+    , toJSON <$> metricFirstReviewToLastApprovalMeanTime
+    , toJSON <$> metricFirstReviewToLastApprovalMedianTime
+    , toJSON <$> metricFirstReviewToLastApprovalMeanTimeExcludingBots
+    , toJSON <$> metricFirstReviewToLastApprovalMeanTimeExcludingBotsMin5m
+    , toJSON <$> metricFirstReviewToLastApprovalMedianTimeExcludingBotsMin5m
+    , toJSON <$> metricSingleApprovePercentage
+    , toJSON <$> metricSingleApprovePercentageExcludingBots
     , toJSON <$> metricFirstCommenterMeanTime
     , toJSON <$> metricFirstReviewerMeanTime
     , toJSON <$> metricCommitsPerChange

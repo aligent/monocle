@@ -2,6 +2,9 @@ jobs:
   compose:
     name: compose-tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: "actions/checkout@v2.4.0"
       - uses: "cachix/install-nix-action@v20"
@@ -41,6 +44,18 @@ jobs:
         run: "nix build .#containerMonocle; docker load < ./result"
       - name: Build docker image
         run: docker build -t quay.io/change-metrics/monocle:latest .
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag and push to GHCR
+        run: |
+          docker tag quay.io/change-metrics/monocle:latest ghcr.io/aligent/monocle:dev
+          docker tag quay.io/change-metrics/monocle:latest ghcr.io/aligent/monocle:${{ github.sha }}
+          docker push ghcr.io/aligent/monocle:dev
+          docker push ghcr.io/aligent/monocle:${{ github.sha }}
       - name: Set Monocle compose image to latest
         run: "echo \"COMPOSE_MONOCLE_VERSION=latest\" > .env"
       - name: Start Monocle compose
@@ -60,3 +75,6 @@ jobs:
 name: Docker
 on:
   pull_request: {}
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true

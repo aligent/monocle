@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Monocle — review metrics</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@200;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header class="top-bar">
+    <img class="wordmark" src="aligent-wordmark.svg" alt="Aligent" />
+    <h1>Review metrics</h1>
+  </header>
+
+  <div id="error-banner" class="banner hidden" role="alert"></div>
+
+  <details class="settings">
+    <summary>API settings</summary>
+    <div class="settings-grid">
+      <div>
+        <label for="api-url">API URL</label>
+        <input type="url" id="api-url" placeholder="http://localhost:8080" />
+      </div>
+      <div>
+        <label for="workspace">Workspace</label>
+        <input type="text" id="workspace" placeholder="aligent" />
+      </div>
+      <div>
+        <button id="settings-save">Save & refresh</button>
+      </div>
+    </div>
+  </details>
+
+  <section class="controls" aria-label="Time range">
+    <div class="from-date">
+      <label for="from-date">From date</label>
+      <input type="date" id="from-date" />
+    </div>
+    <div class="presets">
+      <label>&nbsp;</label>
+      <div class="preset-row">
+        <button class="preset" data-preset="7d">7d</button>
+        <button class="preset" data-preset="30d">30d</button>
+        <button class="preset" data-preset="3m">3mo</button>
+        <button class="preset" data-preset="6m">6mo</button>
+        <button class="preset" data-preset="1y">1y</button>
+      </div>
+    </div>
+    <div>
+      <label for="interval">Interval</label>
+      <select id="interval">
+        <option value="auto">Auto</option>
+        <option value="hour">Hour</option>
+        <option value="day">Day</option>
+        <option value="week">Week</option>
+        <option value="month">Month</option>
+        <option value="year">Year</option>
+      </select>
+    </div>
+    <div>
+      <label>&nbsp;</label>
+      <button id="refresh-btn" class="secondary">Refresh</button>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-mean-time" aria-labelledby="h-mean-time">
+    <div class="panel-header">
+      <h2 id="h-mean-time">1st review → last approval — mean time (excluding bots)</h2>
+      <div class="summary" id="summary-mean-time">
+        <span class="value">—</span>
+        <span class="label">Range mean</span>
+      </div>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-mean-time"></canvas></div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Bucket</th><th class="numeric">Mean time</th></tr>
+        </thead>
+        <tbody id="tbody-mean-time"></tbody>
+        <tfoot>
+          <tr>
+            <td>Average across buckets</td>
+            <td class="numeric" id="tavg-mean-time">—</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-mean-time-min5m" aria-labelledby="h-mean-time-min5m">
+    <div class="panel-header">
+      <h2 id="h-mean-time-min5m">1st review → last approval — mean time (excluding bots, ignoring &lt;5m)</h2>
+      <div class="summary" id="summary-mean-time-min5m">
+        <span class="value">—</span>
+        <span class="label">Range mean</span>
+      </div>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-mean-time-min5m"></canvas></div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Bucket</th><th class="numeric">Mean time</th></tr>
+        </thead>
+        <tbody id="tbody-mean-time-min5m"></tbody>
+        <tfoot>
+          <tr>
+            <td>Average across buckets</td>
+            <td class="numeric" id="tavg-mean-time-min5m">—</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-median-time-min5m" aria-labelledby="h-median-time-min5m">
+    <div class="panel-header">
+      <h2 id="h-median-time-min5m">1st review → last approval — median time (excluding bots, ignoring &lt;5m)</h2>
+      <div class="summary" id="summary-median-time-min5m">
+        <span class="value">—</span>
+        <span class="label">Range median</span>
+      </div>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-median-time-min5m"></canvas></div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Bucket</th><th class="numeric">Median time</th></tr>
+        </thead>
+        <tbody id="tbody-median-time-min5m"></tbody>
+        <tfoot>
+          <tr>
+            <td>Average across buckets</td>
+            <td class="numeric" id="tavg-median-time-min5m">—</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-single-approve" aria-labelledby="h-single-approve">
+    <div class="panel-header">
+      <h2 id="h-single-approve">Single-approve PR percentage (excluding bots)</h2>
+      <div class="summary" id="summary-single-approve">
+        <span class="value">—</span>
+        <span class="label">Range %</span>
+      </div>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-single-approve"></canvas></div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Bucket</th><th class="numeric">Single-approve %</th></tr>
+        </thead>
+        <tbody id="tbody-single-approve"></tbody>
+        <tfoot>
+          <tr>
+            <td>Average across buckets</td>
+            <td class="numeric" id="tavg-single-approve">—</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </section>
+
+  <script src="app.js"></script>
+</body>
+</html>

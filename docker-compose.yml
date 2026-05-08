@@ -37,6 +37,18 @@ services:
     restart: unless-stopped
     volumes:
       - "./etc:/etc/monocle:z"
+  alt-frontend:
+    image: nginx:alpine
+    ports:
+      - "${COMPOSE_ALT_FRONTEND_ADDR:-0.0.0.0}:${COMPOSE_ALT_FRONTEND_PORT:-3001}:80"
+    volumes:
+      - "./alt-frontend:/usr/share/nginx/html:ro"
+      - "./alt-frontend/nginx.conf:/etc/nginx/conf.d/default.conf:ro"
+    healthcheck:
+      retries: 3
+      test: ["CMD-SHELL", "wget -q -O- http://localhost/ >/dev/null || exit 1"]
+      timeout: "10s"
+    restart: unless-stopped
   elastic:
     environment:
       ES_JAVA_OPTS: "-Xms${COMPOSE_ES_XMS:-512m} -Xmx${COMPOSE_ES_XMX:-512m}"
