@@ -2083,6 +2083,34 @@ metricFirstReviewToLastApprovalMeanTimeExcludingBotsMin5m =
        buckets by the change's last-approval date.
        #{queryFlavorToDesc flavor}.|]
 
+-- | Median sibling of metricFirstReviewToLastApprovalMeanTimeExcludingBotsMin5m.
+-- Drops per-change durations under 5 minutes before taking the median.
+-- More robust to slow-tail outliers than the mean.
+metricFirstReviewToLastApprovalMedianTimeExcludingBotsMin5m :: QEffects es => Metric es Duration
+metricFirstReviewToLastApprovalMedianTimeExcludingBotsMin5m =
+  Metric info (Num <$> compute) (firstReviewToLastApprovalTrend' includeMuid agg) topNotSupported
+ where
+  includeMuid = not . isBotMuid
+  flavor = QueryFlavor Author OnCreatedAt
+  minDur = 300 :: Pico
+  agg = medianDurations . filter (>= minDur)
+  compute =
+    Duration . agg
+      <$> withEvents [documentType EChangeReviewedEvent] (withFlavor flavor (firstReviewToLastApprovalOnChanges' includeMuid))
+  info =
+    MetricInfo
+      "first_review_to_last_approval_median_time_excluding_bots_min_5m"
+      "1st review to last approval median time (excluding bots, ignoring <5m)"
+      "Median variant of first_review_to_last_approval_mean_time_excluding_bots_min_5m. Discards per-change durations under 5 minutes, then takes the median."
+      [iii|Median across changes of the duration between the first non-author
+       substantive review (APPROVED or CHANGES_REQUESTED) and the last
+       non-author APPROVED review, with bot accounts excluded both as
+       authors and as reviewers, and per-change durations under 5 minutes
+       (300 seconds) discarded before computing the median. More robust to
+       slow-tail outliers than the mean. Self-reviews and changes never
+       approved are also excluded. The trend buckets by the change's
+       last-approval date. #{queryFlavorToDesc flavor}.|]
+
 -- | Trend bucketed by last-approval date for the single-approve % metrics.
 singleApprovePercentageTrend' ::
   QEffects es =>
@@ -2265,6 +2293,7 @@ allMetrics =
     , toJSON <$> metricFirstReviewToLastApprovalMedianTime
     , toJSON <$> metricFirstReviewToLastApprovalMeanTimeExcludingBots
     , toJSON <$> metricFirstReviewToLastApprovalMeanTimeExcludingBotsMin5m
+    , toJSON <$> metricFirstReviewToLastApprovalMedianTimeExcludingBotsMin5m
     , toJSON <$> metricSingleApprovePercentage
     , toJSON <$> metricSingleApprovePercentageExcludingBots
     , toJSON <$> metricFirstCommenterMeanTime
