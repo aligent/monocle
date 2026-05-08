@@ -117,6 +117,31 @@
     </div>
   </section>
 
+  <section class="panel" id="panel-median-time-min5m" aria-labelledby="h-median-time-min5m">
+    <div class="panel-header">
+      <h2 id="h-median-time-min5m">1st review → last approval — median time (excluding bots, ignoring &lt;5m)</h2>
+      <div class="summary" id="summary-median-time-min5m">
+        <span class="value">—</span>
+        <span class="label">Range median</span>
+      </div>
+    </div>
+    <div class="chart-wrap"><canvas id="chart-median-time-min5m"></canvas></div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Bucket</th><th class="numeric">Median time</th></tr>
+        </thead>
+        <tbody id="tbody-median-time-min5m"></tbody>
+        <tfoot>
+          <tr>
+            <td>Average across buckets</td>
+            <td class="numeric" id="tavg-median-time-min5m">—</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+  </section>
+
   <section class="panel" id="panel-single-approve" aria-labelledby="h-single-approve">
     <div class="panel-header">
       <h2 id="h-single-approve">Single-approve PR percentage (excluding bots)</h2>

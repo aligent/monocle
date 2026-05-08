@@ -33,6 +33,18 @@
       tableAvgEl: () => document.getElementById("tavg-mean-time-min5m"),
     },
     {
+      id: "first_review_to_last_approval_median_time_excluding_bots_min_5m",
+      title: "1st review to last approval — median time (excluding bots, ignoring <5m)",
+      kind: "duration",
+      summaryLabel: "Median (range)",
+      colour: "imagination-40",
+      panelEl: () => document.getElementById("panel-median-time-min5m"),
+      summaryEl: () => document.getElementById("summary-median-time-min5m"),
+      chartEl: () => document.getElementById("chart-median-time-min5m"),
+      tableBodyEl: () => document.getElementById("tbody-median-time-min5m"),
+      tableAvgEl: () => document.getElementById("tavg-median-time-min5m"),
+    },
+    {
       id: "single_approve_percentage_excluding_bots",
       title: "Single-approve PR percentage (excluding bots)",
       kind: "percentage",
@@ -48,6 +60,7 @@
 
   const COLOURS = {
     imagination: { border: "#DA61F1", fill: "rgba(218, 97, 241, 0.18)" },
+    "imagination-40": { border: "#B83CCB", fill: "rgba(240, 192, 249, 0.45)" },
     depth: { border: "#010D2D", fill: "rgba(1, 13, 45, 0.14)" },
     "depth-80": { border: "#343D57", fill: "rgba(52, 61, 87, 0.16)" },
   };
